@@ -254,6 +254,8 @@ DLL_EXPORT_XLSXIO int xlsxioread_sheet_next_row (xlsxioreadersheet sheethandle);
  */
 DLL_EXPORT_XLSXIO XLSXIOCHAR* xlsxioread_sheet_next_cell (xlsxioreadersheet sheethandle);
 
+DLL_EXPORT_XLSXIO XLSXIOCHAR* xlsxioread_sheet_next_cell_with_format (xlsxioreadersheet sheethandle, int* format);
+
 /*! \brief get next cell from worksheet as a string
  * \param  sheethandle   read handle for worksheet object
  * \param  pvalue        pointer where string will be stored if data is available (caller must free the result)

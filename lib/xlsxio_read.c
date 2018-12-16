@@ -1,5 +1,6 @@
 #include "xlsxio_private.h"
 #include "xlsxio_read_sharedstrings.h"
+#include "xlsxio_read_cellstyles.h"
 #include "xlsxio_read.h"
 #include "xlsxio_version.h"
 #include <stdlib.h>
@@ -888,6 +889,9 @@ struct data_sheet_callback_data {
   XML_Char* celldata;
   size_t celldatalen;
   cell_string_type_enum cell_string_type;
+  int cell_style_idx;
+  int num_format;
+  int* cell_style_formats;
   unsigned int flags;
   XML_Char* skiptag;                        //tag to skip
   size_t skiptagcount;                  //nesting level for current tag to skip
@@ -899,7 +903,7 @@ struct data_sheet_callback_data {
   void* callbackdata;
 };
 
-void data_sheet_callback_data_initialize (struct data_sheet_callback_data* data, struct sharedstringlist* sharedstrings, unsigned int flags, xlsxioread_process_cell_callback_fn cell_callback, xlsxioread_process_row_callback_fn row_callback, void* callbackdata)
+void data_sheet_callback_data_initialize (struct data_sheet_callback_data* data, struct sharedstringlist* sharedstrings, unsigned int flags, xlsxioread_process_cell_callback_fn cell_callback, xlsxioread_process_row_callback_fn row_callback, void* callbackdata, int* cell_style_formats)
 {
   data->xmlparser = NULL;
   data->sharedstrings = sharedstrings;
@@ -909,6 +913,8 @@ void data_sheet_callback_data_initialize (struct data_sheet_callback_data* data,
   data->celldata = NULL;
   data->celldatalen = 0;
   data->cell_string_type = none;
+  data->cell_style_idx = -1;
+  data->cell_style_formats = cell_style_formats;
   data->flags = flags;
   data->skiptag = NULL;
   data->skiptagcount = 0;
@@ -925,6 +931,7 @@ void data_sheet_callback_data_cleanup (struct data_sheet_callback_data* data)
   sharedstringlist_destroy(data->sharedstrings);
   free(data->celldata);
   free(data->skiptag);
+  free(data->cell_style_formats);
 }
 
 void data_sheet_expat_callback_skip_tag_start (void* callbackdata, const XML_Char* name, const XML_Char** atts)
@@ -1122,6 +1129,13 @@ void data_sheet_expat_callback_find_cell_start (void* callbackdata, const XML_Ch
       data->cell_string_type = shared_string;
     else
       data->cell_string_type = value_string;
+
+    const XML_Char* s = get_expat_attr_by_name(atts, X("s"));
+    if (s != NULL) {
+      sscanf(s, "%d", &data->cell_style_idx);
+    } else {
+      data->cell_style_idx = -1;
+    }
     //prepare empty value data
     free(data->celldata);
     data->celldata = NULL;
@@ -1151,6 +1165,11 @@ void data_sheet_expat_callback_find_cell_end (void* callbackdata, const XML_Char
         //unknown value type
         free(data->celldata);
         data->celldata = NULL;
+      }
+      if (data->cell_style_idx > -1 && data->cell_style_idx < 256) {
+        data->num_format = data->cell_style_formats[data->cell_style_idx];
+      } else {
+        data->num_format = -1;
       }
     }
     //reset data
@@ -1268,17 +1287,29 @@ DLL_EXPORT_XLSXIO int xlsxioread_process (xlsxioreader handle, const XLSXIOCHAR*
     shared_strings_callback_data_cleanup(&sharedstringsdata);
   }
 
+  // styles
+  int* cell_style_formats = NULL;
+  if (getrelscallbackdata.stylesfile && getrelscallbackdata.stylesfile[0]) {
+    cell_style_formats = malloc(256 * sizeof(int));
+    struct cell_styles_callback_data cell_styles_data;
+    cell_styles_callback_data_initialize(&cell_styles_data, cell_style_formats);
+    if (expat_process_zip_file(handle->zip, getrelscallbackdata.stylesfile, cell_styles_callback_find_start, NULL, NULL, &cell_styles_data, &cell_styles_data.xmlparser) != 0) {
+      free(cell_style_formats);
+      cell_style_formats = NULL;
+    }
+  }
+
   //process sheet
   if (!(flags & XLSXIOREAD_NO_CALLBACK)) {
     //use callback mechanism
     struct data_sheet_callback_data processcallbackdata;
-    data_sheet_callback_data_initialize(&processcallbackdata, sharedstrings, flags, cell_callback, row_callback, callbackdata);
+    data_sheet_callback_data_initialize(&processcallbackdata, sharedstrings, flags, cell_callback, row_callback, callbackdata, cell_style_formats);
     expat_process_zip_file(handle->zip, getrelscallbackdata.sheetfile, data_sheet_expat_callback_find_worksheet_start, NULL, NULL, &processcallbackdata, &processcallbackdata.xmlparser);
     data_sheet_callback_data_cleanup(&processcallbackdata);
   } else {
     //use simplified interface by suspending the XML parser when data is found
     xlsxioreadersheet sheethandle = (xlsxioreadersheet)callbackdata;
-    data_sheet_callback_data_initialize(&sheethandle->processcallbackdata, sharedstrings, flags, NULL, NULL, sheethandle);
+    data_sheet_callback_data_initialize(&sheethandle->processcallbackdata, sharedstrings, flags, NULL, NULL, sheethandle, cell_style_formats);
     if ((sheethandle->zipfile = XML_Char_openzip(sheethandle->handle->zip, getrelscallbackdata.sheetfile, 0)) == NULL) {
       result = 1;
     }
@@ -1485,6 +1516,64 @@ DLL_EXPORT_XLSXIO XLSXIOCHAR* xlsxioread_sheet_next_cell (xlsxioreadersheet shee
     }
   }
   sheethandle->lastcolnr = sheethandle->processcallbackdata.colnr;
+  return result;
+}
+
+DLL_EXPORT_XLSXIO XLSXIOCHAR* xlsxioread_sheet_next_cell_with_format (xlsxioreadersheet sheethandle, int* format)
+{
+  XML_Char* result;
+  if (!sheethandle)
+    return NULL;
+  //append empty column if needed
+  if (sheethandle->paddingcol) {
+    if (sheethandle->paddingcol > sheethandle->processcallbackdata.cols) {
+      //last empty column added, finish row
+      sheethandle->paddingcol = 0;
+      //when padding rows prepare for the next one
+      if (sheethandle->paddingrow) {
+        sheethandle->lastrownr++;
+        sheethandle->paddingrow++;
+        if (sheethandle->paddingrow + 1 < sheethandle->processcallbackdata.rownr) {
+          sheethandle->paddingcol = 1;
+        }
+      }
+      return NULL;
+    } else {
+      //add another empty column
+      sheethandle->paddingcol++;
+      return XML_Char_dup(X(""));
+    }
+  }
+  //get value
+  if (!sheethandle->processcallbackdata.celldata)
+    if (expat_process_zip_file_resume(sheethandle->zipfile, sheethandle->processcallbackdata.xmlparser) != XML_STATUS_SUSPENDED)
+      sheethandle->processcallbackdata.celldata = NULL;
+  //insert empty rows if needed
+  if (!(sheethandle->processcallbackdata.flags & XLSXIOREAD_SKIP_EMPTY_ROWS) && sheethandle->lastrownr + 1 < sheethandle->processcallbackdata.rownr) {
+    sheethandle->paddingrow = sheethandle->lastrownr + 1;
+    sheethandle->paddingcol = sheethandle->processcallbackdata.colnr*0 + 1;
+    return xlsxioread_sheet_next_cell_with_format(sheethandle, format);
+  }
+  //insert empty column before if needed
+  if (!(sheethandle->processcallbackdata.flags & XLSXIOREAD_SKIP_EMPTY_CELLS)) {
+    if (sheethandle->lastcolnr + 1 < sheethandle->processcallbackdata.colnr) {
+      sheethandle->lastcolnr++;
+      return XML_Char_dup(X(""));
+    }
+  }
+  result = sheethandle->processcallbackdata.celldata;
+  sheethandle->processcallbackdata.celldata = NULL;
+  //end of row
+  if (!result) {
+    sheethandle->lastrownr = sheethandle->processcallbackdata.rownr;
+    //insert empty column at end if row if needed
+    if (!result && !(sheethandle->processcallbackdata.flags & XLSXIOREAD_SKIP_EMPTY_CELLS) && sheethandle->processcallbackdata.colnr < sheethandle->processcallbackdata.cols) {
+      sheethandle->paddingcol = sheethandle->lastcolnr + 1;
+      return xlsxioread_sheet_next_cell_with_format(sheethandle, format);
+    }
+  }
+  sheethandle->lastcolnr = sheethandle->processcallbackdata.colnr;
+  *format = sheethandle->processcallbackdata.num_format;
   return result;
 }
 
